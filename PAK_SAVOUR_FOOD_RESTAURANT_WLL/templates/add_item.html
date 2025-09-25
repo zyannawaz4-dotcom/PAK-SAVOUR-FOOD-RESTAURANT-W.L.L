@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="section-title">Add New Item</h2>
+<form method="POST">
+    <label for="name">Name:</label>
+    <input type="text" name="name" required>
+
+    <label for="price">Price ({{ currency }}):</label>
+    <input type="number" step="0.01" name="price" required>
+
+    <label for="image">Image Filename (optional):</label>
+    <input type="text" name="image">
+
+    <button type="submit" class="btn">Add Item</button>
+</form>
+{% endblock %}

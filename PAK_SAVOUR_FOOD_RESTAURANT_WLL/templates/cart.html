@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Cart</h2>
+{% if cart_items %}
+  <ul>
+    {% for i in cart_items %}
+      <li>{{ i.product_name }} x {{ i.quantity }} = {{ currency }}{{ (i.price * i.quantity)|round(2) }}</li>
+    {% endfor %}
+  </ul>
+  <p><b>Total: {{ currency }}{{ total }}</b></p>
+  <form method="post" action="{{ url_for('checkout') }}">
+      <button type="submit">Checkout</button>
+  </form>
+{% else %}
+  <p>Your cart is empty.</p>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>POS - Orders</h2>
+
+<form method="post">
+  <label>Select Product:</label>
+  <select name="product_id">
+    {% for p in products %}
+      <option value="{{ p.id }}">{{ p.name }} - {{ currency_symbol }}{{ p.price }}</option>
+    {% endfor %}
+  </select>
+  Quantity: <input type="number" name="quantity" value="1" min="1">
+  <button type="submit">Add</button>
+</form>
+
+<h3>Current Orders</h3>
+<ul>
+  {% for order in orders %}
+    <li>Order #{{ order.id }} - {{ order.customer_name }} - {{ order.payment_method }} - Total: {{ currency_symbol }}{{ order.total_price }}</li>
+  {% endfor %}
+</ul>
+{% endblock %}

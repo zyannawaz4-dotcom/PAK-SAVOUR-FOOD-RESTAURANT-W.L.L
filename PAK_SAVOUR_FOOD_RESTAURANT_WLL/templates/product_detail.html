@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Products{% endblock %}
+
+{% block content %}
+    <h2>Products</h2>
+    <p>Currency: {{ currency }}</p>
+
+    <ul>
+        {% for product in products %}
+        <li>
+            {{ product.name }} – {{ product.price }}
+            <a href="{{ url_for('pos.add_to_cart', product_id=product.id) }}" class="btn">Add</a>
+        </li>
+        {% endfor %}
+    </ul>
+{% endblock %}

@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="section-title">Reports</h2>
+
+<h3>Total Sales Today: {{ total_sales }} {{ currency }}</h3>
+
+<h3>Most Sold Products:</h3>
+<ul>
+    {% for name, qty in most_sold %}
+    <li>{{ name }} - {{ qty }}</li>
+    {% endfor %}
+</ul>
+
+<h3>Wastage Report:</h3>
+<ul>
+    {% for name, waste in wastage_items.items() %}
+    <li>{{ name }} - {{ waste }}</li>
+    {% endfor %}
+</ul>
+{% endblock %}

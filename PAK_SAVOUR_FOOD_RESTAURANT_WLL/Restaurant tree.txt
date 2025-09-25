@@ -1,0 +1,53 @@
+restaurant_pos_app/
+│
+├── restaurant_pos_app.py        # Main Flask app (entry point)
+├── config.py                    # (optional) Configurations (DB, secret key, mail, etc.)
+├── requirements.txt             # All dependencies
+├── __init__.py                  # (if you make it a package)
+│
+├── /instance/
+│   └── restaurant.db            # SQLite database (auto-created)
+│
+├── /templates/                  # All HTML templates
+│   ├── base.html
+│   ├── home.html
+│   ├── login.html
+│   ├── register.html
+│   ├── verify_email.html
+│   ├── cart.html
+│   ├── product_detail.html
+│   │
+│   ├── /admin/                  # Admin templates
+│   │   ├── admin_login.html
+│   │   ├── admin_dashboard.html
+│   │   ├── admin_add_product.html
+│   │   ├── expenses.html
+│   │   ├── reports.html
+│   │   └── pos.html
+│
+├── /static/                     # Static assets (CSS, JS, images)
+│   ├── css/
+│   │   └── style.css
+│   ├── js/
+│   │   └── script.js
+│   └── images/
+│       └── logo.png
+│
+├── /models/                     # Database models (if you split them out)
+│   ├── __init__.py
+│   ├── user.py
+│   ├── product.py
+│   ├── order.py
+│   └── expense.py
+│
+├── /routes/                     # Flask routes/blueprints (optional split)
+│   ├── __init__.py
+│   ├── auth.py                  # Login/register/email verify
+│   ├── pos.py                   # POS routes (orders, checkout)
+│   ├── expenses.py              # Expenses management
+│   ├── reports.py               # Daily/monthly reports
+│   └── admin.py                 # Admin dashboard & product mgmt
+│
+└── /utils/                      # Helper functions
+    ├── currency.py              # Currency conversion
+    └── email_utils.py           # Email sending

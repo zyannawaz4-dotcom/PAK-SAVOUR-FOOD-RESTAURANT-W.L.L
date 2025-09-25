@@ -1,0 +1,590 @@
+from flask import Flask, render_template, render_template_string, redirect, url_for, flash, session, request, abort
+from flask_sqlalchemy import SQLAlchemy
+from flask_mail import Mail, Message
+from flask_login import LoginManager, login_user, logout_user, current_user, login_required, UserMixin
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, date
+import threading
+import webbrowser
+import requests
+import os
+
+"""
+Restaurant POS upgrade for your existing Flask shop:
+- Keeps your users/products/categories/cart.
+- Adds Orders with items at checkout (status Paid/Pending/Cancelled).
+- Adds Expenses (raw material, electricity, salary, other).
+- Adds Daily & Monthly reports (sales, expenses, profit) + quick HTML views.
+- Adds /pos screen for fast ordering at counter.
+
+Pack to .exe with PyInstaller (Windows):
+  pyinstaller --onefile --noconsole \
+    --add-data "templates;templates" \
+    --add-data "static;static" \
+    restaurant_pos_app.py
+
+Notes:
+- If you don't have templates for the new pages, minimal inline HTML is used.
+- Currency conversion preserved; BASE_CURRENCY = USD for storage.
+- First admin auto-created: admin@megamart.com / admin123
+"""
+
+app = Flask(__name__)
+
+SUPPORTED_CURRENCIES = ['USD', 'EUR', 'GBP', 'BHD', 'AED']
+BASE_CURRENCY = 'USD'
+exchange_rates = {}
+
+app.config['SECRET_KEY'] = 'change_this_to_a_strong_secret_key'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///store.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Mail (optional)
+app.config['MAIL_SERVER'] = 'smtp.gmail.com'
+app.config['MAIL_PORT'] = 587
+app.config['MAIL_USE_TLS'] = True
+app.config['MAIL_USERNAME'] = 'your_email@gmail.com'
+app.config['MAIL_PASSWORD'] = 'your_email_password_or_app_password'
+app.config['MAIL_DEFAULT_SENDER'] = ('Zyan Megamart', 'your_email@gmail.com')
+
+mail = Mail(app)
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
+
+# ---------- Models ----------
+class User(db.Model, UserMixin):
+    __tablename__ = 'user'
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+    is_admin = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+class Category(db.Model):
+    __tablename__ = 'category'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), unique=True, nullable=False)
+
+class Product(db.Model):
+    __tablename__ = 'product'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    description = db.Column(db.Text)
+    price = db.Column(db.Float, nullable=False)  # stored in BASE_CURRENCY
+    image = db.Column(db.String(255))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    category_id = db.Column(db.Integer, db.ForeignKey('category.id'))
+    category = db.relationship('Category', backref='products')
+
+class Order(db.Model):
+    __tablename__ = 'order'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    total = db.Column(db.Float)
+    status = db.Column(db.String(50), default='Paid')  # Paid, Pending, Cancelled
+    payment_method = db.Column(db.String(50), default='Cash')
+    customer_name = db.Column(db.String(120))
+    table_no = db.Column(db.String(30))
+    user = db.relationship('User', backref='orders')
+
+class OrderItem(db.Model):
+    __tablename__ = 'order_item'
+    id = db.Column(db.Integer, primary_key=True)
+    order_id = db.Column(db.Integer, db.ForeignKey('order.id'))
+    product_id = db.Column(db.Integer, db.ForeignKey('product.id'))
+    quantity = db.Column(db.Integer)
+    price = db.Column(db.Float)  # unit price at time of sale (BASE_CURRENCY)
+    order = db.relationship('Order', backref='items')
+    product = db.relationship('Product')
+
+class CartItem(db.Model):
+    __tablename__ = 'cart_item'
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.String(100), index=True)
+    product_id = db.Column(db.Integer, db.ForeignKey('product.id'))
+    quantity = db.Column(db.Integer, default=1)
+    product = db.relationship('Product')
+
+class Expense(db.Model):
+    __tablename__ = 'expense'
+    id = db.Column(db.Integer, primary_key=True)
+    date = db.Column(db.Date, default=date.today)
+    category = db.Column(db.String(50), nullable=False)  # Raw, Electricity, Salary, Rent, Other
+    amount = db.Column(db.Float, nullable=False)  # stored in BASE_CURRENCY
+    note = db.Column(db.String(255))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+# ---------- Auth ----------
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+# ---------- Currency Helpers ----------
+def fetch_exchange_rates():
+    global exchange_rates
+    url = "https://open.er-api.com/v6/latest/USD"
+    try:
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        if data.get('result') == 'success':
+            exchange_rates = data['rates']
+        else:
+            exchange_rates = {cur: 1.0 for cur in SUPPORTED_CURRENCIES}
+    except Exception:
+        exchange_rates = {cur: 1.0 for cur in SUPPORTED_CURRENCIES}
+
+fetch_exchange_rates()
+
+CURRENCY_SYMBOLS = {
+    'USD': '$',
+    'EUR': '€',
+    'GBP': '£',
+    'BHD': '.د.ب',
+    'AED': 'د.إ',
+}
+
+def convert_price(amount_usd: float) -> float:
+    currency = session.get('currency', BASE_CURRENCY)
+    rate = exchange_rates.get(currency, 1.0)
+    return round((amount_usd or 0.0) * rate, 2)
+
+def get_currency_symbol() -> str:
+    return CURRENCY_SYMBOLS.get(session.get('currency', BASE_CURRENCY), '$')
+
+@app.before_request
+def set_currency_mw():
+    currency = request.args.get('currency')
+    if currency and currency in SUPPORTED_CURRENCIES:
+        session['currency'] = currency
+    if 'currency' not in session:
+        session['currency'] = BASE_CURRENCY
+
+# ---------- Context ----------
+@app.context_processor
+def inject_common():
+    categories = Category.query.order_by(Category.name).all()
+    return dict(categories=categories, currency_symbol=get_currency_symbol())
+
+# ---------- Core Shop Routes (minimal home/search/product kept) ----------
+@app.route('/')
+def home():
+    products = Product.query.order_by(Product.created_at.desc()).all()
+    products_data = [
+        {
+            'id': p.id,
+            'name': p.name,
+            'description': p.description,
+            'price': convert_price(p.price),
+            'image': p.image,
+        }
+        for p in products
+    ]
+    # Use existing template if present; else inline fallback
+    try:
+        return render_template('home.html', products=products_data, current_currency=session.get('currency'), supported_currencies=SUPPORTED_CURRENCIES)
+    except Exception:
+        return render_template_string(
+            '''<h2>Products</h2>
+            <p>Currency: {{current_currency}} ({{currency_symbol}})</p>
+            <ul>
+            {% for p in products %}
+              <li>
+                {{p.name}} – {{currency_symbol}}{{p.price}} 
+                <a href="{{ url_for('add_to_cart', product_id=p.id) }}">Add</a>
+              </li>
+            {% endfor %}
+            </ul>
+            <p><a href="{{ url_for('cart') }}">Cart</a> | <a href="{{ url_for('pos') }}">POS</a> | <a href="{{ url_for('reports') }}">Reports</a> | <a href="{{ url_for('expenses') }}">Expenses</a></p>
+            ''',
+            products=products_data,
+            current_currency=session.get('currency'),
+            currency_symbol=get_currency_symbol(),
+        )
+
+@app.route('/product/<int:product_id>')
+def product_detail(product_id):
+    p = Product.query.get_or_404(product_id)
+    data = {
+        'id': p.id,
+        'name': p.name,
+        'description': p.description,
+        'price': convert_price(p.price),
+        'image': p.image,
+    }
+    try:
+        return render_template('product_detail.html', product=data)
+    except Exception:
+        return render_template_string('<h3>{{product.name}}</h3><p>{{product.description}}</p><p>{{currency_symbol}}{{product.price}}</p>', product=data, currency_symbol=get_currency_symbol())
+
+@app.route('/add_to_cart/<int:product_id>')
+def add_to_cart(product_id):
+    product = Product.query.get_or_404(product_id)
+    session_id = session.get('cart_id') or os.urandom(24).hex()
+    session['cart_id'] = session_id
+    item = CartItem.query.filter_by(session_id=session_id, product_id=product.id).first()
+    if item:
+        item.quantity += 1
+    else:
+        db.session.add(CartItem(session_id=session_id, product_id=product.id, quantity=1))
+    db.session.commit()
+    flash(f'Added "{product.name}" to cart.', 'success')
+    return redirect(request.referrer or url_for('home'))
+
+@app.route('/cart')
+def cart():
+    session_id = session.get('cart_id')
+    items = CartItem.query.filter_by(session_id=session_id).all() if session_id else []
+    total = sum(convert_price(i.product.price) * i.quantity for i in items)
+    try:
+        return render_template('cart.html', cart_items=items, total=total, currency_symbol=get_currency_symbol())
+    except Exception:
+        return render_template_string(
+            '''<h2>Cart</h2>
+            <ul>
+            {% for i in cart_items %}
+              <li>{{i.product.name}} x {{i.quantity}} = {{currency_symbol}}{{ (i.product.price * i.quantity) | round(2) }}</li>
+            {% endfor %}
+            </ul>
+            <p>Total (shown in {{session.get('currency')}}): <b>{{currency_symbol}}{{total}}</b></p>
+            <form method="post" action="{{ url_for('checkout') }}">
+              Customer: <input name="customer_name"> Table: <input name="table_no" size=4>
+              <select name="payment_method"><option>Cash</option><option>Card</option><option>Online</option></select>
+              <button type="submit">Checkout</button>
+            </form>
+            ''', cart_items=items, total=total, currency_symbol=get_currency_symbol(), session=session)
+
+@app.route('/checkout', methods=['POST'])
+def checkout():
+    session_id = session.get('cart_id')
+    if not session_id:
+        flash('Your cart is empty.', 'error')
+        return redirect(url_for('home'))
+    items = CartItem.query.filter_by(session_id=session_id).all()
+    if not items:
+        flash('Your cart is empty.', 'error')
+        return redirect(url_for('home'))
+
+    # Create order in BASE_CURRENCY values
+    total_usd = sum((i.product.price or 0.0) * i.quantity for i in items)
+    order = Order(
+        user_id=current_user.id if getattr(current_user, 'is_authenticated', False) else None,
+        total=round(total_usd, 2),
+        status='Paid',
+        payment_method=request.form.get('payment_method', 'Cash'),
+        customer_name=request.form.get('customer_name') or None,
+        table_no=request.form.get('table_no') or None,
+    )
+    db.session.add(order)
+    db.session.flush()  # get order.id
+
+    for i in items:
+        db.session.add(OrderItem(order_id=order.id, product_id=i.product_id, quantity=i.quantity, price=i.product.price))
+        db.session.delete(i)  # clear cart
+
+    db.session.commit()
+    session.pop('cart_id', None)
+
+    # Optional: email receipt to logged-in user
+    if getattr(current_user, 'is_authenticated', False):
+        try:
+            html = render_template('emails/order_confirmation.html', user=current_user)
+        except Exception:
+            html = f"<p>Thanks for your order #{order.id} total {order.total} {BASE_CURRENCY}</p>"
+        try:
+            send_email('Your order receipt', [current_user.email], html)
+        except Exception:
+            pass
+
+    flash('Order placed. Receipt generated.', 'success')
+    return redirect(url_for('order_confirmation', order_id=order.id))
+
+@app.route('/order_confirmation')
+def order_confirmation():
+    oid = request.args.get('order_id')
+    try:
+        return render_template('order_confirmation.html', order_id=oid)
+    except Exception:
+        return render_template_string('<h3>Order Confirmed</h3><p>Order ID: {{oid}}</p><a href="{{url_for("pos")}}">Back to POS</a>', oid=oid)
+
+# ---------- POS Screen ----------
+@app.route('/pos')
+@login_required
+def pos():
+    if not current_user.is_admin:
+        # You may relax this if all staff use POS
+        abort(403)
+    products = Product.query.order_by(Product.name).all()
+    session_id = session.get('cart_id')
+    items = CartItem.query.filter_by(session_id=session_id).all() if session_id else []
+    total = sum(convert_price(i.product.price) * i.quantity for i in items)
+    return render_template_string(
+        '''<h2>POS</h2>
+        <form method="get" action="{{ url_for('home') }}"><button>Shop View</button></form>
+        <div style="display:flex; gap:32px; align-items:flex-start;">
+          <div style="width:55%">
+            <input id="q" placeholder="Search..." onkeyup="filter()">
+            <ul id="plist">
+            {% for p in products %}
+              <li data-name="{{p.name|lower}}">
+                {{p.name}} – {{currency_symbol}}{{ convert_price(p.price) }}
+                <a href="{{ url_for('add_to_cart', product_id=p.id) }}">Add</a>
+              </li>
+            {% endfor %}
+            </ul>
+          </div>
+          <div style="width:40%">
+            <h3>Cart</h3>
+            <ul>
+            {% for i in items %}
+              <li>{{i.product.name}} x {{i.quantity}} ({{currency_symbol}}{{ convert_price(i.product.price) }})</li>
+            {% endfor %}
+            </ul>
+            <p><b>Total: {{currency_symbol}}{{total}}</b></p>
+            <form method="post" action="{{ url_for('checkout') }}">
+              Customer: <input name="customer_name"> Table: <input name="table_no" size=4>
+              <select name="payment_method"><option>Cash</option><option>Card</option><option>Online</option></select>
+              <button type="submit">Checkout</button>
+            </form>
+          </div>
+        </div>
+        <script>
+          function filter(){
+            const q = document.getElementById('q').value.toLowerCase();
+            document.querySelectorAll('#plist li').forEach(li=>{
+              li.style.display = li.dataset.name.includes(q) ? '' : 'none';
+            });
+          }
+        </script>
+        ''', products=products, items=items, total=total, convert_price=convert_price, currency_symbol=get_currency_symbol())
+
+# ---------- Expenses ----------
+@app.route('/expenses', methods=['GET', 'POST'])
+@login_required
+def expenses():
+    if not current_user.is_admin:
+        abort(403)
+    if request.method == 'POST':
+        cat = request.form.get('category') or 'Other'
+        amt = float(request.form.get('amount') or 0)
+        dt = request.form.get('date')
+        dt = datetime.strptime(dt, '%Y-%m-%d').date() if dt else date.today()
+        note = request.form.get('note')
+        db.session.add(Expense(category=cat, amount=amt, date=dt, note=note))
+        db.session.commit()
+        flash('Expense saved.', 'success')
+        return redirect(url_for('expenses'))
+    latest = Expense.query.order_by(Expense.date.desc(), Expense.id.desc()).limit(50).all()
+    total_today = sum(e.amount for e in latest if e.date == date.today())
+    return render_template_string(
+        '''<h2>Expenses</h2>
+        <form method="post">
+          <input type="date" name="date" value="{{today}}"> 
+          <select name="category">
+            <option>Raw</option><option>Electricity</option><option>Salary</option><option>Rent</option><option>Other</option>
+          </select>
+          <input name="amount" type="number" step="0.01" placeholder="Amount ({{base}})">
+          <input name="note" placeholder="Note">
+          <button type="submit">Add</button>
+        </form>
+        <p>Today expenses: {{currency_symbol}}{{ convert_price(total_today) }}</p>
+        <table border=1 cellpadding=6>
+          <tr><th>Date</th><th>Category</th><th>Amount ({{base}})</th><th>Note</th></tr>
+          {% for e in latest %}
+            <tr><td>{{e.date}}</td><td>{{e.category}}</td><td>{{e.amount}}</td><td>{{e.note}}</td></tr>
+          {% endfor %}
+        </table>
+        ''', latest=latest, today=date.today().strftime('%Y-%m-%d'), base=BASE_CURRENCY, total_today=total_today, convert_price=convert_price, currency_symbol=get_currency_symbol())
+
+# ---------- Reports ----------
+@app.route('/reports')
+@login_required
+def reports():
+    if not current_user.is_admin:
+        abort(403)
+    # Filters
+    day_str = request.args.get('day')  # YYYY-MM-DD
+    month_str = request.args.get('month')  # YYYY-MM
+
+    # Daily report
+    def daily_metrics(d: date):
+        start = datetime(d.year, d.month, d.day)
+        end = datetime(d.year, d.month, d.day, 23, 59, 59)
+        sales_usd = db.session.query(db.func.coalesce(db.func.sum(Order.total), 0.0)).filter(Order.status=='Paid', Order.created_at.between(start, end)).scalar() or 0.0
+        expenses_usd = db.session.query(db.func.coalesce(db.func.sum(Expense.amount), 0.0)).filter(Expense.date==d).scalar() or 0.0
+        profit_usd = sales_usd - expenses_usd
+        return sales_usd, expenses_usd, profit_usd
+
+    # Monthly report
+    def month_metrics(ym: str):
+        y, m = map(int, ym.split('-'))
+        start = datetime(y, m, 1)
+        if m == 12:
+            end = datetime(y+1, 1, 1)
+        else:
+            end = datetime(y, m+1, 1)
+        sales_usd = db.session.query(db.func.coalesce(db.func.sum(Order.total), 0.0)).filter(Order.status=='Paid', Order.created_at>=start, Order.created_at<end).scalar() or 0.0
+        expenses_usd = db.session.query(db.func.coalesce(db.func.sum(Expense.amount), 0.0)).filter(Expense.date>=start.date(), Expense.date<end.date()).scalar() or 0.0
+        profit_usd = sales_usd - expenses_usd
+        return sales_usd, expenses_usd, profit_usd
+
+    today = date.today()
+    # Defaults
+    d_query = datetime.strptime(day_str, '%Y-%m-%d').date() if day_str else today
+    m_query = month_str if month_str else today.strftime('%Y-%m')
+
+    d_sales, d_exp, d_profit = daily_metrics(d_query)
+    m_sales, m_exp, m_profit = month_metrics(m_query)
+
+    return render_template_string(
+        '''<h2>Reports</h2>
+        <form method="get">
+          <label>Day:</label> <input type="date" name="day" value="{{d_query}}">
+          <label>Month:</label> <input type="month" name="month" value="{{m_query}}">
+          <button type="submit">Refresh</button>
+        </form>
+        <h3>Daily ({{d_query}})</h3>
+        <ul>
+          <li>Sales: {{currency_symbol}}{{ convert_price(d_sales) }}</li>
+          <li>Expenses: {{currency_symbol}}{{ convert_price(d_exp) }}</li>
+          <li><b>Profit: {{currency_symbol}}{{ convert_price(d_profit) }}</b></li>
+        </ul>
+        <h3>Monthly ({{m_query}})</h3>
+        <ul>
+          <li>Sales: {{currency_symbol}}{{ convert_price(m_sales) }}</li>
+          <li>Expenses: {{currency_symbol}}{{ convert_price(m_exp) }}</li>
+          <li><b>Profit: {{currency_symbol}}{{ convert_price(m_profit) }}</b></li>
+        </ul>
+        <p><a href="{{ url_for('pos') }}">POS</a> | <a href="{{ url_for('expenses') }}">Expenses</a> | <a href="/">Home</a></p>
+        ''',
+        d_query=d_query.strftime('%Y-%m-%d'), m_query=m_query,
+        d_sales=d_sales, d_exp=d_exp, d_profit=d_profit,
+        m_sales=m_sales, m_exp=m_exp, m_profit=m_profit,
+        convert_price=convert_price, currency_symbol=get_currency_symbol())
+
+# ---------- Auth routes (minimal) ----------
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        email = (request.form.get('email') or '').lower()
+        password = request.form.get('password') or ''
+        user = User.query.filter_by(email=email).first()
+        if user and user.check_password(password):
+            login_user(user)
+            flash('Logged in.', 'success')
+            return redirect(request.args.get('next') or url_for('pos'))
+        flash('Invalid credentials.', 'error')
+    return render_template_string('''
+        <h3>Login</h3>
+        <form method="post">
+          <input name="email" placeholder="Email">
+          <input name="password" type="password" placeholder="Password">
+          <button>Login</button>
+        </form>
+    ''')
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    flash('Logged out.', 'success')
+    return redirect(url_for('login'))
+
+# ---------- Admin: minimal category/product add (optional) ----------
+@app.route('/admin/add_category', methods=['GET', 'POST'])
+@login_required
+def admin_add_category():
+    if not current_user.is_admin:
+        abort(403)
+    if request.method == 'POST':
+        name = (request.form.get('name') or '').strip()
+        if name and not Category.query.filter_by(name=name).first():
+            db.session.add(Category(name=name))
+            db.session.commit()
+            flash('Category added.', 'success')
+            return redirect(url_for('admin_add_category'))
+        flash('Name required or exists.', 'error')
+    return render_template_string('''
+      <h3>Add Category</h3>
+      <form method="post"><input name="name" placeholder="Name"><button>Add</button></form>
+      <p><a href="/">Home</a></p>
+    ''')
+
+@app.route('/admin/add_product', methods=['GET', 'POST'])
+@login_required
+def admin_add_product():
+    if not current_user.is_admin:
+        abort(403)
+    cats = Category.query.order_by(Category.name).all()
+    if request.method == 'POST':
+        name = request.form.get('name')
+        price = float(request.form.get('price') or 0)
+        cid = int(request.form.get('category_id')) if request.form.get('category_id') else None
+        desc = request.form.get('description')
+        img = request.form.get('image')
+        if not name or not price or not cid:
+            flash('Name, price, category required.', 'error')
+        else:
+            db.session.add(Product(name=name, price=price, category_id=cid, description=desc, image=img))
+            db.session.commit()
+            flash('Product added.', 'success')
+            return redirect(url_for('admin_add_product'))
+    return render_template_string('''
+      <h3>Add Product</h3>
+      <form method="post">
+        <input name="name" placeholder="Name">
+        <input name="price" type="number" step="0.01" placeholder="Price ({{base}})">
+        <select name="category_id">
+          {% for c in cats %}<option value="{{c.id}}">{{c.name}}</option>{% endfor %}
+        </select>
+        <input name="image" placeholder="Image URL">
+        <textarea name="description" placeholder="Description"></textarea>
+        <button>Add</button>
+      </form>
+      <p><a href="/">Home</a></p>
+    ''', cats=cats, base=BASE_CURRENCY)
+
+# ---------- Email helper ----------
+def send_email(subject, recipients, html_body):
+    try:
+        msg = Message(subject, recipients=recipients)
+        msg.html = html_body
+        mail.send(msg)
+    except Exception:
+        pass
+
+# ---------- Bootstrap & run ----------
+def _open_browser():
+    webbrowser.open_new('http://127.0.0.1:5000/')
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+        # seed admin
+        if not User.query.filter_by(email='admin@megamart.com').first():
+            admin = User(email='admin@megamart.com', is_admin=True)
+            admin.set_password('admin123')
+            db.session.add(admin)
+            db.session.commit()
+        # seed a default category/product for quick test
+        if not Category.query.first():
+            cat = Category(name='Food')
+            db.session.add(cat)
+            db.session.commit()
+        if not Product.query.first():
+            p = Product(name='Burger', price=3.50, category_id=Category.query.first().id)
+            db.session.add(p)
+            db.session.add(Product(name='Fries', price=1.25, category_id=Category.query.first().id))
+            db.session.add(Product(name='Soda', price=0.99, category_id=Category.query.first().id))
+            db.session.commit()
+
+    # Open browser automatically (disable if you wrap with a window shell)
+    threading.Timer(1.0, _open_browser).start()
+    app.run(debug=True)
